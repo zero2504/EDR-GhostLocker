@@ -1,11 +1,6 @@
-#define _CRT_SECURE_NO_WARNINGS
-
 #include <Windows.h>
 #include <iostream>
 #include <string>
-#include <TlHelp32.h>
-#include <vector>
-
 
 
 #define RED     "\x1b[31m"
