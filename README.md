@@ -27,6 +27,11 @@ AppLocker was introduced with **Windows 7** and enhanced in **Windows 8.1, 10 (E
 - Performs rule evaluation using `SeSrpAccessCheck`
 - Optionally monitors DLL loads (disabled by default for performance reasons)
 
+> **Clarification:**  
+> While `AppID.sys` performs rule evaluation in kernel mode, DLL enforcement is not autonomous.  
+> The kernel driver does not actively monitor DLL loads by itself. Instead, user-mode components must explicitly query the driver via IOCTL to determine whether a DLL load is permitted.  
+> As a result, AppLocker DLL rules effectively act as a client-side protection mechanism.
+
 
 ### Rule Types and Enforcement
 
@@ -53,6 +58,29 @@ HKLM\Software\Policies\Microsoft\Windows\SrpV2     (XML policy storage, persiste
 HKLM\SYSTEM\CurrentControlSet\Control\Srp\Gp\Exe  (SDDL binary format, active enforcement)
 HKLM\SYSTEM\CurrentControlSet\Control\AppID\CertStore (Certificate cache)
 ```
+
+### Service & SYSTEM Process Enforcement (Often Overlooked)
+
+By default, AppLocker does **not enforce rules on services or SYSTEM processes**.  
+There is no graphical user interface option to enable this behavior.
+
+Enforcement for services can only be enabled via the XML policy using `RuleCollectionExtensions`.
+
+The following policy section is required to enforce AppLocker rules on services:
+
+
+```
+<RuleCollectionExtensions>
+  <ThresholdExtensions>
+    <Services EnforcementMode="Enabled"/>
+  </ThresholdExtensions>
+  <RedstoneExtensions>
+    <SystemApps Allow="Enabled"/>
+  </RedstoneExtensions>
+</RuleCollectionExtensions>
+```
+As indicated by the extension names, these options are supported only on Windows 10+ and are not available on earlier versions.
+See [Microsoft - AppLocker rule collection extensions](https://learn.microsoft.com/en-us/windows/security/application-security/application-control/app-control-for-business/applocker/rule-collection-extensions)
 
 ### Enforcement Flow:
 
@@ -86,13 +114,23 @@ However, extensive testing reveals that this telemetry becomes functionally inef
 
 ### Tool Overview
 
-**GhostLocker** is a C++ implementation that automates AppLocker policy deployment to block EDR executables. The tool performs three primary functions:
-
-1. **Process Discovery**: Enumerates running processes to identify EDR targets
-2. **Path Resolution**: Resolves NT device paths to Win32 filesystem paths
-3. **Policy Deployment**: Generates and applies AppLocker deny rules via PowerShell
+**GhostLocker** is a C++ implementation that automates AppLocker policy deployment to block EDR executables. 
 
 ### Technical Implementation Analysis
+#### Implementation Variants
+
+GhostLocker provides two implementation variants:
+
+#### `main.cpp` – Dynamic Enumeration Version
+This version enumerates running processes and resolves their full image paths using native APIs (`NtQuerySystemInformation`).  
+The resolved absolute paths are then used to generate precise AppLocker deny rules.
+
+The tool uses `CreateToolhelp32Snapshot` with `TH32CS_SNAPPROCESS` to enumerate all running processes. It compares process names against a predefined target list using case-insensitive matching (`_wcsicmp`).
+
+**Why this approach?**
+- Lightweight and fast enumeration
+- No elevated privileges required for reading process list
+- Case-insensitive matching handles naming variations
 
 #### 1. Process Enumeration (`FindTargetsAndQueryPaths`)
 
@@ -104,13 +142,6 @@ const wchar_t* targetNames[] = {
     L"EDR_Component_Name.exe",
 };
 ```
-
-The tool uses `CreateToolhelp32Snapshot` with `TH32CS_SNAPPROCESS` to enumerate all running processes. It compares process names against a predefined target list using case-insensitive matching (`_wcsicmp`).
-
-**Why this approach?**
-- Lightweight and fast enumeration
-- No elevated privileges required for reading process list
-- Case-insensitive matching handles naming variations
 
 #### 2. Path Resolution via NtQuerySystemInformation
 
@@ -211,6 +242,11 @@ void RunPowerShellInMemory()
 - **`-ExecutionPolicy Bypass`**: Ignores script execution policy
 - **`runas` verb**: Triggers UAC elevation for administrative rights
 
+#### `main_improved.cpp` – Static Wildcard-Based Version
+After clarification from **diversenok**, it became clear that AppLocker path rules support wildcard matching and do not require full executable paths.
+
+This improved version removes all process enumeration and native path resolution logic and instead relies on static wildcard rules such as: `*\MsMpEng.exe`
+
 ---
 
 ## Requirements
@@ -276,6 +312,10 @@ Breaking this coupling effectively blinds the EDR despite continued telemetry co
 
 <img width="1242" height="927" alt="Screenshot 2025-12-10 123246" src="https://github.com/user-attachments/assets/eb358319-9450-4a34-9c1a-0d37423e814c" />
 
+
+**Screenshot of Version 2**
+<img width="2192" height="517" alt="Screenshot 2025-12-19 152900" src="https://github.com/user-attachments/assets/90a92441-9a7b-415c-b246-95c4f3e3316e" />
+
 ---
 
 ## Comparison: WDAC vs. AppLocker
@@ -336,8 +376,42 @@ EFI System Partition (UEFI enforcement)
 - Target has no WDAC enforcement
 
 ---
+## Detection & Prevention Guidance
 
+### 1. Pre-Execution Policy Evaluation
 
+Windows provides the `Get-AppLockerFileInformation` API, which allows testing whether a specific executable would be blocked under the current AppLocker policy.
+
+An EDR can use this mechanism to proactively verify whether its own binaries or services would be denied execution after a policy change.  
+If a core component transitions from allowed to denied, this should be treated as a high-confidence tamper condition.
+
+### 2. AppLocker Policy Change Monitoring
+
+AppLocker policy updates are communicated to `AppID.sys` via explicit IOCTL calls from user mode.  
+This provides a clear signal path indicating that enforcement state has changed.
+
+Kernel drivers can observe these notifications and correlate them with subsequent execution failures of protected services, enabling accurate detection of policy-based neutralization.
+
+### 3. Persistence and Reboot Correlation
+
+AppLocker policies are persisted across reboots in well-defined registry locations.  
+EDR solutions can snapshot relevant policy state before reboot and verify enforcement consistency after system startup.
+
+A mismatch between expected execution state and post-reboot enforcement strongly indicates intentional policy manipulation.
+
+### 4. Built-in Exclusion Mechanisms
+
+Windows includes native mechanisms for excluding processes from SRP/AppLocker enforcement.  
+Security products are expected to integrate with these mechanisms to ensure operational continuity.
+
+Failure to account for these exclusions is not a limitation of AppLocker, but rather an architectural oversight in the protected product.
+
+### Summary
+
+None of these detection strategies require bypassing AppLocker or violating Windows security boundaries.  
+They rely solely on documented behavior and interfaces already provided by the operating system.
+
+---
 ## Conclusion
 
 **GhostLocker** demonstrates that AppLocker, a legitimate Windows security feature, can be weaponized to neutralize EDR solutions through userland process blocking. 
@@ -357,6 +431,7 @@ This research highlights fundamental architectural vulnerabilities in current ED
 - Direct API usage without PowerShell dependencies
 
 ---
+
 
 ## Disclaimer
 
